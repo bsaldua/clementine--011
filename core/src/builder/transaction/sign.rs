@@ -1,0 +1,628 @@
+//! # Transaction Signing Utilities
+//!
+//! This module provides logic signing the transactions used in the Clementine bridge.
+
+use super::challenge::create_watchtower_challenge_txhandler;
+use super::{ContractContext, TxHandlerCache};
+use crate::actor::{Actor, TweakCache, WinternitzDerivationPath};
+use crate::bitvm_client::ClementineBitVMPublicKeys;
+use crate::builder;
+use crate::builder::transaction::creator::ReimburseDbCache;
+use crate::citrea::CitreaClientT;
+use crate::config::protocol::ProtocolParamset;
+use crate::config::BridgeConfig;
+use crate::database::{Database, DatabaseTransaction};
+use crate::deposit::KickoffData;
+use crate::operator::Operator;
+use crate::utils::Last20Bytes;
+use crate::verifier::Verifier;
+use bitcoin::hashes::Hash;
+use bitcoin::{BlockHash, OutPoint, Transaction, XOnlyPublicKey};
+use clementine_errors::BridgeError;
+use clementine_errors::{TransactionType, TxError};
+use clementine_primitives::RoundIndex;
+use eyre::Context;
+use rand_chacha::rand_core::SeedableRng;
+use rand_chacha::ChaCha12Rng;
+use secp256k1::rand::seq::SliceRandom;
+
+/// Data to identify the deposit and kickoff.
+#[derive(Debug, Clone)]
+pub struct TransactionRequestData {
+    pub deposit_outpoint: OutPoint,
+    pub kickoff_data: KickoffData,
+}
+
+/// Deterministically (given same seed) generates a set of kickoff indices for an operator to sign, using the operator's public key, deposit block hash, and deposit outpoint as the seed.
+/// To make the output consistent across versions, a fixed rng algorithm (ChaCha12Rng) is used.
+///
+/// This function creates a deterministic seed from the operator's public key, deposit block hash,
+/// and deposit outpoint, then uses it to select a subset of kickoff indices.
+/// deposit_blockhash is also included in the seed to ensure the randomness of the selected kickoff indices, otherwise deposit_outpoint
+/// can be selected in a way to create hash collisions by the user depositing.
+///
+/// # Arguments
+/// * `paramset` - Protocol parameter set.
+/// * `op_xonly_pk` - Operator's x-only public key.
+/// * `deposit_blockhash` - Block hash of the block containing the deposit.
+/// * `deposit_outpoint` - Outpoint of the deposit.
+///
+/// # Returns
+/// A vector of indices that the operator should sign, with the count determined by the protocol parameter `num_signed_kickoffs`.
+pub fn get_kickoff_utxos_to_sign(
+    paramset: &'static ProtocolParamset,
+    op_xonly_pk: XOnlyPublicKey,
+    deposit_blockhash: BlockHash,
+    deposit_outpoint: bitcoin::OutPoint,
+) -> Vec<usize> {
+    let deposit_data = [
+        op_xonly_pk.serialize().to_vec(),
+        deposit_blockhash.to_byte_array().to_vec(),
+        deposit_outpoint.txid.to_byte_array().to_vec(),
+        deposit_outpoint.vout.to_le_bytes().to_vec(),
+    ]
+    .concat();
+
+    let seed = bitcoin::hashes::sha256d::Hash::hash(&deposit_data).to_byte_array();
+    let mut rng = ChaCha12Rng::from_seed(seed);
+
+    let mut numbers: Vec<usize> = (0..paramset.num_kickoffs_per_round).collect();
+    numbers.shuffle(&mut rng);
+
+    numbers
+        .into_iter()
+        .take(paramset.num_signed_kickoffs)
+        .collect()
+}
+
+/// Creates and signs all transaction types that can be signed by the entity.
+///
+/// This function handles the creation and signing of transactions based on the provided
+/// transaction data. It returns a vector of signed transactions with their corresponding types.
+///
+/// # Note
+/// This function should not be used for transaction types that require special handling:
+/// - MiniAsserts
+/// - WatchtowerChallenge
+/// - LatestBlockhash
+/// - Disprove
+///
+/// These transaction types have their own specialized signing flows.
+pub async fn create_and_sign_txs(
+    db: Database,
+    signer: &Actor,
+    config: BridgeConfig,
+    context: ContractContext,
+    block_hash: Option<[u8; 20]>, //to sign kickoff
+    dbtx: Option<DatabaseTransaction<'_>>,
+) -> Result<Vec<(TransactionType, Transaction)>, BridgeError> {
+    let txhandlers = builder::transaction::create_txhandlers(
+        match context.is_context_for_kickoff() {
+            true => TransactionType::AllNeededForDeposit,
+            // if context is only for a round, we can only sign the round txs
+            false => TransactionType::Round,
+        },
+        context.clone(),
+        &mut TxHandlerCache::new(),
+        &mut match context.is_context_for_kickoff() {
+            true => ReimburseDbCache::new_for_deposit(
+                db.clone(),
+                context.operator_xonly_pk,
+                context
+                    .deposit_data
+                    .as_ref()
+                    .expect("Already checked existence of deposit data")
+                    .get_deposit_outpoint(),
+                config.protocol_paramset(),
+                dbtx,
+            ),
+            false => ReimburseDbCache::new_for_rounds(
+                db.clone(),
+                context.operator_xonly_pk,
+                config.protocol_paramset(),
+                dbtx,
+            ),
+        },
+    )
+    .await?;
+
+    let mut signatures = Vec::new();
+
+    if context.is_context_for_kickoff() {
+        // signatures saved during deposit
+        let deposit_sigs_query = db
+            .get_deposit_signatures(
+                None,
+                context
+                    .deposit_data
+                    .as_ref()
+                    .expect("Should have deposit data at this point")
+                    .get_deposit_outpoint(),
+                context.operator_xonly_pk,
+                context.round_idx,
+                context
+                    .kickoff_idx
+                    .expect("Already checked existence of kickoff idx") as usize,
+            )
+            .await?;
+        signatures.extend(deposit_sigs_query.unwrap_or_default());
+    }
+
+    // signatures saved during setup
+    let setup_sigs_query = db
+        .get_unspent_kickoff_sigs(None, context.operator_xonly_pk, context.round_idx)
+        .await?;
+
+    signatures.extend(setup_sigs_query.unwrap_or_default());
+
+    let mut signed_txs = Vec::with_capacity(txhandlers.len());
+    let mut tweak_cache = TweakCache::default();
+
+    for (tx_type, mut txhandler) in txhandlers.into_iter() {
+        let _ = signer
+            .tx_sign_and_fill_sigs(&mut txhandler, &signatures, Some(&mut tweak_cache))
+            .wrap_err(format!(
+                "Couldn't sign transaction {tx_type:?} in create_and_sign_txs for context {context:?}"
+            ));
+
+        if let TransactionType::OperatorChallengeAck(watchtower_idx) = tx_type {
+            let path = WinternitzDerivationPath::ChallengeAckHash(
+                watchtower_idx as u32,
+                context
+                    .deposit_data
+                    .as_ref()
+                    .expect("Should have deposit data at this point")
+                    .get_deposit_outpoint(),
+                config.protocol_paramset(),
+            );
+            let preimage = signer.generate_preimage_from_path(path)?;
+            let _ = signer.tx_sign_preimage(&mut txhandler, preimage);
+        }
+
+        if let TransactionType::Kickoff = tx_type {
+            if let Some(block_hash) = block_hash {
+                // need to commit blockhash to start kickoff
+                let path = WinternitzDerivationPath::Kickoff(
+                    context.round_idx,
+                    context
+                        .kickoff_idx
+                        .expect("Should have kickoff idx at this point"),
+                    config.protocol_paramset(),
+                );
+                signer.tx_sign_winternitz(&mut txhandler, &[(block_hash.to_vec(), path)])?;
+            }
+            // do not give err if blockhash was not given
+        }
+
+        let checked_txhandler = txhandler.promote();
+
+        match checked_txhandler {
+            Ok(checked_txhandler) => {
+                signed_txs.push((tx_type, checked_txhandler.get_cached_tx().clone()));
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "Couldn't sign transaction {:?} in create_and_sign_all_txs: {:?}.
+                    This might be normal if the transaction is not needed to be/cannot be signed.",
+                    tx_type,
+                    e
+                );
+            }
+        }
+    }
+
+    Ok(signed_txs)
+}
+
+impl<C> Verifier<C>
+where
+    C: CitreaClientT,
+{
+    /// Creates and signs the watchtower challenge with the given commit data.
+    ///
+    /// # Arguments
+    /// * `transaction_data` - Data to identify the deposit and kickoff.
+    /// * `commit_data` - Commit data for the watchtower challenge.
+    ///
+    /// # Returns
+    /// A tuple of:
+    ///     1. TransactionType: WatchtowerChallenge
+    ///     2. Transaction: Signed watchtower challenge transaction
+    pub async fn create_watchtower_challenge(
+        &self,
+        transaction_data: TransactionRequestData,
+        commit_data: &[u8],
+        dbtx: Option<DatabaseTransaction<'_>>,
+    ) -> Result<(TransactionType, Transaction), BridgeError> {
+        if commit_data.len() != self.config.protocol_paramset().watchtower_challenge_bytes {
+            return Err(TxError::IncorrectWatchtowerChallengeDataLength.into());
+        }
+
+        let deposit_data = self
+            .db
+            .get_deposit_data(None, transaction_data.deposit_outpoint)
+            .await?
+            .ok_or(BridgeError::DepositNotFound(
+                transaction_data.deposit_outpoint,
+            ))?
+            .1;
+
+        let context = ContractContext::new_context_with_signer(
+            transaction_data.kickoff_data,
+            deposit_data.clone(),
+            self.config.protocol_paramset(),
+            self.signer.clone(),
+        );
+
+        let mut txhandlers = builder::transaction::create_txhandlers(
+            TransactionType::AllNeededForDeposit,
+            context,
+            &mut TxHandlerCache::new(),
+            &mut ReimburseDbCache::new_for_deposit(
+                self.db.clone(),
+                transaction_data.kickoff_data.operator_xonly_pk,
+                transaction_data.deposit_outpoint,
+                self.config.protocol_paramset(),
+                dbtx,
+            ),
+        )
+        .await?;
+
+        let kickoff_txhandler = txhandlers
+            .remove(&TransactionType::Kickoff)
+            .ok_or(TxError::TxHandlerNotFound(TransactionType::Kickoff))?;
+
+        let watchtower_index = deposit_data.get_watchtower_index(&self.signer.xonly_public_key)?;
+
+        let mut watchtower_challenge_txhandler = create_watchtower_challenge_txhandler(
+            &kickoff_txhandler,
+            watchtower_index,
+            commit_data,
+            self.config.protocol_paramset(),
+            #[cfg(test)]
+            &self.config.test_params,
+        )?;
+
+        self.signer
+            .tx_sign_and_fill_sigs(&mut watchtower_challenge_txhandler, &[], None)?;
+
+        Ok((
+            TransactionType::WatchtowerChallenge(watchtower_index),
+            watchtower_challenge_txhandler.get_cached_tx().clone(),
+        ))
+    }
+
+    /// Creates and signs all the unspent kickoff connector (using the previously saved signatures from operator during setup)
+    ///  transactions for a single round of an operator.
+    ///
+    /// # Arguments
+    /// * `round_idx` - Index of the round.
+    /// * `operator_xonly_pk` - Operator's x-only public key.
+    ///
+    /// # Returns
+    /// A vector of tuples:
+    ///     1. TransactionType: UnspentKickoff(idx) for idx'th kickoff in the round
+    ///     2. Transaction: Signed unspent kickoff connector transaction
+    pub async fn create_and_sign_unspent_kickoff_connector_txs(
+        &self,
+        round_idx: RoundIndex,
+        operator_xonly_pk: XOnlyPublicKey,
+        mut dbtx: Option<DatabaseTransaction<'_>>,
+    ) -> Result<Vec<(TransactionType, Transaction)>, BridgeError> {
+        let context = ContractContext::new_context_for_round(
+            operator_xonly_pk,
+            round_idx,
+            self.config.protocol_paramset(),
+        );
+
+        let txhandlers = builder::transaction::create_txhandlers(
+            TransactionType::UnspentKickoff(0),
+            context,
+            &mut TxHandlerCache::new(),
+            &mut ReimburseDbCache::new_for_rounds(
+                self.db.clone(),
+                operator_xonly_pk,
+                self.config.protocol_paramset(),
+                dbtx.as_deref_mut(),
+            ),
+        )
+        .await?;
+
+        // signatures saved during setup
+        let unspent_kickoff_sigs = self
+            .db
+            .get_unspent_kickoff_sigs(dbtx, operator_xonly_pk, round_idx)
+            .await?
+            .ok_or(eyre::eyre!(
+                "No unspent kickoff signatures found for operator {:?} and round {:?}",
+                operator_xonly_pk,
+                round_idx
+            ))?;
+
+        let mut signed_txs = Vec::with_capacity(txhandlers.len());
+        let mut tweak_cache = TweakCache::default();
+
+        for (tx_type, mut txhandler) in txhandlers.into_iter() {
+            if !matches!(tx_type, TransactionType::UnspentKickoff(_)) {
+                // do not try to sign unrelated txs
+                continue;
+            }
+            let res = self.signer
+                .tx_sign_and_fill_sigs(
+                    &mut txhandler,
+                    &unspent_kickoff_sigs,
+                    Some(&mut tweak_cache),
+                )
+                .wrap_err(format!(
+                    "Couldn't sign transaction {tx_type:?} in create_and_sign_unspent_kickoff_connector_txs for round {round_idx:?} and operator {operator_xonly_pk:?}",
+                ));
+
+            let checked_txhandler = txhandler.promote();
+
+            match checked_txhandler {
+                Ok(checked_txhandler) => {
+                    signed_txs.push((tx_type, checked_txhandler.get_cached_tx().clone()));
+                }
+                Err(e) => {
+                    tracing::trace!(
+                        "Couldn't sign transaction {:?} in create_and_sign_unspent_kickoff_connector_txs: {:?}: {:?}",
+                        tx_type,
+                        e,
+                        res.err()
+                    );
+                }
+            }
+        }
+
+        Ok(signed_txs)
+    }
+}
+
+impl<C> Operator<C>
+where
+    C: CitreaClientT,
+{
+    /// Creates and signs all the assert commitment transactions for a single kickoff of an operator.
+    ///
+    /// # Arguments
+    /// * `assert_data` - Data to identify the deposit and kickoff.
+    /// * `commit_data` - BitVM assertions for the kickoff, for each assert tx.
+    ///
+    /// # Returns
+    /// A vector of tuples:
+    ///     1. TransactionType: MiniAssert(idx) for idx'th assert commitment
+    ///     2. Transaction: Signed assert commitment transaction
+    pub async fn create_assert_commitment_txs(
+        &self,
+        assert_data: TransactionRequestData,
+        commit_data: Vec<Vec<Vec<u8>>>,
+        dbtx: Option<DatabaseTransaction<'_>>,
+    ) -> Result<Vec<(TransactionType, Transaction)>, BridgeError> {
+        let deposit_data = self
+            .db
+            .get_deposit_data(None, assert_data.deposit_outpoint)
+            .await?
+            .ok_or(BridgeError::DepositNotFound(assert_data.deposit_outpoint))?
+            .1;
+
+        let context = ContractContext::new_context_with_signer(
+            assert_data.kickoff_data,
+            deposit_data.clone(),
+            self.config.protocol_paramset(),
+            self.signer.clone(),
+        );
+
+        let mut txhandlers = builder::transaction::create_txhandlers(
+            TransactionType::MiniAssert(0),
+            context,
+            &mut TxHandlerCache::new(),
+            &mut ReimburseDbCache::new_for_deposit(
+                self.db.clone(),
+                self.signer.xonly_public_key,
+                assert_data.deposit_outpoint,
+                self.config.protocol_paramset(),
+                dbtx,
+            ),
+        )
+        .await?;
+
+        let mut signed_txhandlers = Vec::new();
+
+        for idx in 0..ClementineBitVMPublicKeys::number_of_assert_txs() {
+            let mut mini_assert_txhandler = txhandlers
+                .remove(&TransactionType::MiniAssert(idx))
+                .ok_or(TxError::TxHandlerNotFound(TransactionType::MiniAssert(idx)))?;
+            let derivations = ClementineBitVMPublicKeys::get_assert_derivations(
+                idx,
+                assert_data.deposit_outpoint,
+                self.config.protocol_paramset(),
+            );
+            // Combine data to be committed with the corresponding bitvm derivation path (needed to regenerate the winternitz secret keys
+            // to sign the transaction)
+            let winternitz_data: Vec<(Vec<u8>, WinternitzDerivationPath)> = derivations
+                .iter()
+                .zip(commit_data[idx].iter())
+                .map(|(derivation, commit_data)| match derivation {
+                    WinternitzDerivationPath::BitvmAssert(_len, _, _, _, _) => {
+                        (commit_data.clone(), derivation.clone())
+                    }
+                    _ => unreachable!(),
+                })
+                .collect();
+            self.signer
+                .tx_sign_winternitz(&mut mini_assert_txhandler, &winternitz_data)?;
+            signed_txhandlers.push(mini_assert_txhandler.promote()?);
+        }
+
+        Ok(signed_txhandlers
+            .into_iter()
+            .map(|txhandler| {
+                (
+                    txhandler.get_transaction_type(),
+                    txhandler.get_cached_tx().clone(),
+                )
+            })
+            .collect())
+    }
+
+    /// Creates and signs the latest blockhash transaction for a single kickoff of an operator.
+    ///
+    /// # Arguments
+    /// * `assert_data` - Data to identify the deposit and kickoff.
+    /// * `block_hash` - Block hash to commit using winternitz signatures.
+    ///
+    /// # Returns
+    /// A tuple of:
+    ///     1. TransactionType: LatestBlockhash
+    ///     2. Transaction: Signed latest blockhash transaction
+    pub async fn create_latest_blockhash_tx(
+        &self,
+        assert_data: TransactionRequestData,
+        block_hash: BlockHash,
+        dbtx: Option<DatabaseTransaction<'_>>,
+    ) -> Result<(TransactionType, Transaction), BridgeError> {
+        let deposit_data = self
+            .db
+            .get_deposit_data(None, assert_data.deposit_outpoint)
+            .await?
+            .ok_or(BridgeError::DepositNotFound(assert_data.deposit_outpoint))?
+            .1;
+
+        let context = ContractContext::new_context_with_signer(
+            assert_data.kickoff_data,
+            deposit_data,
+            self.config.protocol_paramset(),
+            self.signer.clone(),
+        );
+
+        let mut txhandlers = builder::transaction::create_txhandlers(
+            TransactionType::LatestBlockhash,
+            context,
+            &mut TxHandlerCache::new(),
+            &mut ReimburseDbCache::new_for_deposit(
+                self.db.clone(),
+                assert_data.kickoff_data.operator_xonly_pk,
+                assert_data.deposit_outpoint,
+                self.config.protocol_paramset(),
+                dbtx,
+            ),
+        )
+        .await?;
+
+        let mut latest_blockhash_txhandler =
+            txhandlers
+                .remove(&TransactionType::LatestBlockhash)
+                .ok_or(TxError::TxHandlerNotFound(TransactionType::LatestBlockhash))?;
+
+        let block_hash: [u8; 32] = {
+            let raw = block_hash.to_byte_array();
+
+            #[cfg(test)]
+            {
+                self.config.test_params.maybe_disrupt_block_hash(raw)
+            }
+
+            #[cfg(not(test))]
+            {
+                raw
+            }
+        };
+
+        // get last 20 bytes of block_hash
+        let block_hash_last_20 = block_hash.last_20_bytes().to_vec();
+
+        tracing::info!(
+            "Creating latest blockhash tx with block hash's last 20 bytes: {:?}",
+            block_hash_last_20
+        );
+        self.signer.tx_sign_winternitz(
+            &mut latest_blockhash_txhandler,
+            &[(
+                block_hash_last_20,
+                ClementineBitVMPublicKeys::get_latest_blockhash_derivation(
+                    assert_data.deposit_outpoint,
+                    self.config.protocol_paramset(),
+                ),
+            )],
+        )?;
+
+        let latest_blockhash_txhandler = latest_blockhash_txhandler.promote()?;
+
+        // log the block hash witness
+        tracing::info!(
+            "Latest blockhash tx created with block hash witness: {:?}",
+            latest_blockhash_txhandler.get_cached_tx().input
+        );
+
+        Ok((
+            latest_blockhash_txhandler.get_transaction_type(),
+            latest_blockhash_txhandler.get_cached_tx().to_owned(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use crate::test::common::create_test_config_with_thread_name;
+
+    use super::*;
+
+    #[tokio::test]
+    /// Checks if get_kickoff_utxos_to_sign returns the same values as before.
+    /// This test should never fail, do not make changes to code that changes the result of
+    /// get_kickoff_utxos_to_sign, as doing so will invalidate all past deposits.
+    async fn test_get_kickoff_utxos_to_sign_consistency() {
+        let config = create_test_config_with_thread_name().await;
+        let mut paramset = config.protocol_paramset().clone();
+        paramset.num_kickoffs_per_round = 2000;
+        paramset.num_signed_kickoffs = 20;
+        let paramset_ref: &'static ProtocolParamset = Box::leak(Box::new(paramset));
+        let op_xonly_pk = XOnlyPublicKey::from_str(
+            "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0",
+        )
+        .unwrap();
+        let deposit_blockhash =
+            BlockHash::from_str("0000000000000000000000000000000000000000000000000000000000000000")
+                .unwrap();
+        let deposit_outpoint = OutPoint::from_str(
+            "0000000000000000000000000000000000000000000000000000000000000000:0",
+        )
+        .unwrap();
+        let utxos_to_sign = get_kickoff_utxos_to_sign(
+            paramset_ref,
+            op_xonly_pk,
+            deposit_blockhash,
+            deposit_outpoint,
+        );
+        assert_eq!(utxos_to_sign.len(), 20);
+        assert_eq!(
+            utxos_to_sign,
+            vec![
+                1124, 447, 224, 1664, 1673, 1920, 713, 125, 1936, 1150, 1079, 1922, 596, 984, 567,
+                1134, 530, 539, 700, 1864
+            ]
+        );
+
+        // one more test
+        let deposit_blockhash =
+            BlockHash::from_str("1100000000000000000000000000000000000000000000000000000000000000")
+                .unwrap();
+        let utxos_to_sign = get_kickoff_utxos_to_sign(
+            paramset_ref,
+            op_xonly_pk,
+            deposit_blockhash,
+            deposit_outpoint,
+        );
+
+        assert_eq!(utxos_to_sign.len(), 20);
+        assert_eq!(
+            utxos_to_sign,
+            vec![
+                1454, 26, 157, 1900, 451, 1796, 881, 544, 23, 1080, 1112, 1503, 1233, 1583, 1054,
+                603, 329, 1635, 213, 1331
+            ]
+        );
+    }
+}

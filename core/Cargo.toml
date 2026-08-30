@@ -1,0 +1,121 @@
+[package]
+name = "clementine-core"
+version = { workspace = true }
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+rust-version = "1.88.0"
+
+[features]
+automation = ["dep:clementine-tx-sender"]
+integration-tests = [
+  "automation"
+]
+
+[build-dependencies]
+tonic-build = "0.12"
+vergen-git2 = { workspace = true }
+
+[dependencies]
+metrics = { workspace = true }
+metrics-derive = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+metrics-util = { workspace = true }
+color-eyre = { workspace = true }
+bitcoin = { workspace = true, features = ["rand", "bitcoinconsensus"] }
+bitcoincore-rpc = { workspace = true }
+hex = { workspace = true, features = ["serde"] }
+hex-literal = { workspace = true }
+lazy_static = { workspace = true, features = ["spin_no_std"] }
+sha2 = { workspace = true }
+risc0-zkvm = { workspace = true, features = ["prove"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+secp256k1 = { workspace = true, features = ["serde", "rand", "std"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tokio = { workspace = true, features = ["full"] }
+jsonrpsee = { workspace = true, features = ["http-client", "macros"] }
+async-trait = { workspace = true }
+futures = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+toml = { workspace = true }
+sqlx = { workspace = true, features = ["runtime-tokio", "postgres", "macros", "migrate"] }
+borsh = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+tokio-stream = { workspace = true }
+async-stream = { workspace = true }
+futures-util = { workspace = true }
+futures-core = { workspace = true }
+bitvm = { workspace = true }
+tempfile = { workspace = true }
+eyre = { workspace = true }
+tokio-retry = { workspace = true }
+http = { workspace = true }
+hyper = { workspace = true }
+tower = { workspace = true }
+hyper-util = { workspace = true }
+alloy = { workspace = true }
+alloy-sol-types = { workspace = true }
+ark-groth16 = { workspace = true, features = ["default"] }
+ark-bn254 = { workspace = true }
+ark-serialize = { workspace = true }
+statig = { workspace = true, features = ["async", "serde"] }
+pgmq = { workspace = true }
+serde_with = { workspace = true }
+citrea-sov-rollup-interface = { workspace = true, features = ["native"] }
+rand_chacha = { workspace = true }
+log = { workspace = true }
+circuits-lib = { path = "../circuits-lib", features = ["test-utils"] }
+clementine-errors = { path = "../crates/clementine-errors" }
+clementine-primitives = { path = "../crates/clementine-primitives" }
+clementine-config = { path = "../crates/clementine-config" }
+clementine-utils = { path = "../crates/clementine-utils" }
+clementine-extended-rpc = { path = "../crates/clementine-extended-rpc", features = ["test-utils"] }
+# There is a problem with not using citrea feature for txsender for now because they are in the same workspace when --all-features is used, we can remove it when we move tx-sender outside
+clementine-tx-sender = { path = "../crates/clementine-tx-sender", optional = true }
+bridge-circuit-host = { path = "../bridge-circuit-host" }
+bincode = { workspace = true }
+ark-ff = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+once_cell = { workspace = true }
+bitcoin-script = { workspace = true }
+secrecy = { workspace = true }
+reqwest = { workspace = true }
+x25519-dalek = { workspace = true, features = ["static_secrets"] }
+chacha20poly1305 = { workspace = true, features = ["stream"] }
+hkdf = { workspace = true }
+semver = { workspace = true }
+
+# UNCOMMENT TO DEBUG TOKIO TASKS
+
+# console-subscriber = { version = "0.4.1" }
+
+[dev-dependencies]
+serial_test = { workspace = true }
+citrea-e2e = { workspace = true }
+base64 = { workspace = true }
+bridge-circuit-host = { path = "../bridge-circuit-host" }
+ctor = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }
+rand = { workspace = true }
+url = { version = "2.5.4" }
+jsonrpc-async = { version = "2.0.2" }
+wiremock = "0.5"
+clementine-tx-sender = { path = "../crates/clementine-tx-sender", features = ["testing", "json-rpc"] }
+
+[[bin]]
+name = "clementine-cli"
+path = "src/bin/cli.rs"
+
+
+[lints.clippy]
+unwrap_used = { level = "deny" }
+
+[lints.rust]
+# This is used to enable/disable the tokio-console debugging utility
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }

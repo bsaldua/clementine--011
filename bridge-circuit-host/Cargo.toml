@@ -1,0 +1,60 @@
+[package]
+name = "bridge-circuit-host"
+version = { workspace = true }
+authors = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+
+[dependencies]
+risc0-zkvm = { workspace = true, features = ["metal", "bonsai", "client", "prove"] }
+risc0-circuit-recursion = { workspace = true }
+risc0-zkp = { workspace = true }
+risc0-groth16 = { workspace = true }
+risc0-binfmt = { workspace = true }
+risc0-core = { version = "2.0.0" }
+
+ark-bn254 = { workspace = true }
+ark-ff = { workspace = true }
+ark-ec = { workspace = true }
+ark-std = { workspace = true }
+ark-crypto-primitives = { workspace = true }
+ark-serialize = { workspace = true }
+ark-relations = { workspace = true }
+ark-groth16 = { workspace = true }
+
+alloy-rpc-types = { workspace = true }
+
+bytemuck = { version = "1.14" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+rand = { workspace = true, features = ["small_rng"] }
+borsh = { workspace = true, features = ["derive"] }
+num-bigint = { workspace = true }
+num-traits = { workspace = true }
+bitcoin = { workspace = true, features = ["serde"] }
+tempfile = { workspace = true }
+blake3 = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"]}
+bincode = { workspace = true }
+hex = { workspace = true }
+hex-literal = { workspace = true }
+tracing = { workspace = true, default-features = false }
+thiserror = { workspace = true }
+eyre = { workspace = true }
+once_cell = { workspace = true }
+tar = { workspace = true }
+
+circuits-lib = { path = "../circuits-lib" }
+
+citrea-sov-rollup-interface = { workspace = true }
+
+
+
+
+
+[features]
+metal = ["risc0-zkvm/metal"]
+use-test-vk = ["circuits-lib/use-test-vk"]

@@ -1,0 +1,28 @@
+# Clementine 🍊
+
+Clementine is Citrea's BitVM based trust-minimized two-way peg program. You can
+check Clementine whitepaper at [citrea.xyz/clementine_whitepaper.pdf](https://citrea.xyz/clementine_whitepaper.pdf).
+
+The repository includes:
+
+- A library for bridge operator, verifiers, aggregator and watchtower
+- Circuits that will be optimistically verified with BitVM
+
+## Documentation
+
+High level documentations are in [docs/](docs). These documentations explains
+the design, architecture and usage of Clementine.
+
+To start using Clementine, jump [docs/usage.md](docs/usage.md) documentation.
+
+Code documentation is also present and can be viewed at
+[chainwayxyz.github.io/clementine/clementine_core](https://chainwayxyz.github.io/clementine/clementine_core/).
+
+It can also be generated locally:
+
+```bash
+cargo doc --no-deps
+```
+
+Documentation will be available at `target/doc/clementine_core/index.html` after
+that.
